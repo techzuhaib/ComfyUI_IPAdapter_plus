@@ -79,7 +79,11 @@ class IPAdapter(nn.Module):
         else:
             self.image_proj_model = self.init_proj()
 
-        self.image_proj_model.load_state_dict(ipadapter_model["image_proj"])
+        state_dict = ipadapter_model["image_proj"]
+        current_state_dict = self.image_proj_model.state_dict()
+        for key in state_dict.keys():
+            if key in current_state_dict and state_dict[key].shape == current_state_dict[key].shape:
+                current_state_dict[key].copy_(state_dict[key])
         self.ip_layers = To_KV(ipadapter_model["ip_adapter"], encoder_hid_proj=encoder_hid_proj, weight_kolors=weight_kolors)
 
     def init_proj(self):
@@ -560,7 +564,7 @@ class IPAdapterUnifiedLoader:
     CATEGORY = "ipadapter"
 
     def load_models(self, model, preset, lora_strength=0.0, provider="CPU", ipadapter=None):
-        pipeline = { "clipvision": { 'file': None, 'model': None }, "ipadapter": { 'file': None, 'model': None }, "insightface": { 'provider': None, 'model': None } } 
+        pipeline = { "clipvision": { 'file': None, 'model': None }, "ipadapter": { 'file': None, 'model': None }, "insightface": { 'provider': None, 'model': None } } } 
         if ipadapter is not None:
             pipeline = ipadapter
 
