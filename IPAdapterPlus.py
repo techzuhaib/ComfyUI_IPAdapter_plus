@@ -1966,6 +1966,7 @@ class IPAdapterCombineParams:
         return {"required": {
             "params_1": ("IPADAPTER_PARAMS",),
             "params_2": ("IPADAPTER_PARAMS",),
+        },
         "optional": {
             "params_3": ("IPADAPTER_PARAMS",),
             "params_4": ("IPADAPTER_PARAMS",),
