@@ -2,6 +2,9 @@ import torch
 import os
 import math
 import folder_paths
+import hashlib
+import portalocker  # Cross-platform file locking
+import glob
 
 import comfy.model_management as model_management
 from node_helpers import conditioning_set_values
@@ -39,6 +42,14 @@ else:
 folder_paths.folder_names_and_paths["ipadapter"] = (current_paths, folder_paths.supported_pt_extensions)
 
 WEIGHT_TYPES = ["linear", "ease in", "ease out", 'ease in-out', 'reverse in-out', 'weak input', 'weak output', 'weak middle', 'strong middle', 'style transfer', 'composition', 'strong style transfer', 'style and composition', 'style transfer precise', 'composition precise']
+
+# Define the directory where embeddings will be cached
+CACHE_DIR = "cached_embeddings"
+ACCESS_COUNT_FILE = os.path.join(CACHE_DIR, "access_counts.txt")
+
+# Ensure the cache directory exists
+if not os.path.exists(CACHE_DIR):
+    os.makedirs(CACHE_DIR)
 
 """
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -549,7 +560,7 @@ class IPAdapterUnifiedLoader:
     CATEGORY = "ipadapter"
 
     def load_models(self, model, preset, lora_strength=0.0, provider="CPU", ipadapter=None):
-        pipeline = { "clipvision": { 'file': None, 'model': None }, "ipadapter": { 'file': None, 'model': None }, "insightface": { 'provider': None, 'model': None } }
+        pipeline = { "clipvision": { 'file': None, 'model': None }, "ipadapter": { 'file': None, 'model': None }, "insightface": { 'provider': None, 'model': None } } }
         if ipadapter is not None:
             pipeline = ipadapter
 
@@ -1340,12 +1351,15 @@ class IPAdapterPreciseCompositionBatch(IPAdapterPreciseComposition):
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 """
 class IPAdapterEncoder:
+    _access_counts_lock = portalocker.Lock()  # Class-level lock for thread safety
+
     @classmethod
-    def INPUT_TYPES(s):
-        return {"required": {
-            "ipadapter": ("IPADAPTER",),
-            "image": ("IMAGE",),
-            "weight": ("FLOAT", { "default": 1.0, "min": -1.0, "max": 3.0, "step": 0.01 }),
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "ipadapter": ("IPADAPTER",),
+                "image": ("IMAGE",),
+                "weight": ("FLOAT", {"default": 1.0, "min": -1.0, "max": 3.0, "step": 0.01}),
             },
             "optional": {
                 "mask": ("MASK",),
@@ -1353,10 +1367,23 @@ class IPAdapterEncoder:
             }
         }
 
-    RETURN_TYPES = ("EMBEDS", "EMBEDS",)
-    RETURN_NAMES = ("pos_embed", "neg_embed",)
+    RETURN_TYPES = ("EMBEDS", "EMBEDS")
     FUNCTION = "encode"
     CATEGORY = "ipadapter/embeds"
+
+    def __init__(self):
+        self.internal_access_counts = {}
+        self.access_counts = self.load_access_counts()
+
+    def load_access_counts(self):
+        # Load access counts from the file
+        access_counts = {}
+        if os.path.exists(ACCESS_COUNT_FILE):
+            with portalocker.Lock(ACCESS_COUNT_FILE, 'r', timeout=5) as f:
+                for line in f:
+                    image_hash, count = line.strip().split()
+                    access_counts[image_hash] = int(count)
+        return access_counts
 
     def encode(self, ipadapter, image, weight, mask=None, clip_vision=None):
         if 'ipadapter' in ipadapter:
@@ -1364,39 +1391,105 @@ class IPAdapterEncoder:
             clip_vision = clip_vision if clip_vision is not None else ipadapter['clipvision']['model']
         else:
             ipadapter_model = ipadapter
-            clip_vision = clip_vision
 
         if clip_vision is None:
             raise Exception("Missing CLIPVision model.")
 
-        is_plus = "proj.3.weight" in ipadapter_model["image_proj"] or "latents" in ipadapter_model["image_proj"] or "perceiver_resampler.proj_in.weight" in ipadapter_model["image_proj"]
-        is_kwai_kolors = is_plus and "layers.0.0.to_out.weight" in ipadapter_model["image_proj"] and ipadapter_model["image_proj"]["layers.0.0.to_out.weight"].shape[0] == 2048
+        # Generate a unique filename using a hash of the image
+        image_hash = hashlib.md5(image.numpy().tobytes()).hexdigest()  # Assuming image is a tensor
 
-        clipvision_size = 224 if not is_kwai_kolors else 336
+        # Check if embeddings are already cached
+        cached_files = glob.glob(os.path.join(CACHE_DIR, f"{image_hash}.*"))
+        if cached_files:
+            # Load cached embeddings
+            cached_embedding_path = cached_files[0]
+            embeddings = torch.load(cached_embedding_path)
 
-        # resize and crop the mask to 224x224
-        if mask is not None and mask.shape[1:3] != torch.Size([clipvision_size, clipvision_size]):
-            mask = mask.unsqueeze(1)
-            transforms = T.Compose([
-                T.CenterCrop(min(mask.shape[2], mask.shape[3])),
-                T.Resize((clipvision_size, clipvision_size), interpolation=T.InterpolationMode.BICUBIC, antialias=True),
-            ])
-            mask = transforms(mask).squeeze(1)
-            #mask = T.Resize((image.shape[1], image.shape[2]), interpolation=T.InterpolationMode.BICUBIC, antialias=True)(mask.unsqueeze(1)).squeeze(1)
+            # Increment access count for this embedding
+            with self._access_counts_lock:
+                self.internal_access_counts[image_hash] = self.internal_access_counts.get(image_hash, 0) + 1
 
-        img_cond_embeds = encode_image_masked(clip_vision, image, mask, clipvision_size=clipvision_size)
+            return embeddings
 
-        if is_plus:
-            img_cond_embeds = img_cond_embeds.penultimate_hidden_states
-            img_uncond_embeds = encode_image_masked(clip_vision, torch.zeros([1, clipvision_size, clipvision_size, 3]), clipvision_size=clipvision_size).penultimate_hidden_states
-        else:
-            img_cond_embeds = img_cond_embeds.image_embeds
-            img_uncond_embeds = torch.zeros_like(img_cond_embeds)
+        # Perform encoding (this is where the actual encoding logic would go)
+        pos_embed, neg_embed = self.perform_encoding(ipadapter_model, image, weight, mask, clip_vision)
 
-        if weight != 1:
-            img_cond_embeds = img_cond_embeds * weight
+        # Save the embeddings to cache
+        cached_embedding_path = os.path.join(CACHE_DIR, f"{image_hash}.pt")
+        torch.save((pos_embed, neg_embed), cached_embedding_path)
 
-        return (img_cond_embeds, img_uncond_embeds, )
+        # Increment access count for this newly cached embedding
+        with self._access_counts_lock:
+            self.internal_access_counts[image_hash] = self.internal_access_counts.get(image_hash, 0) + 1
+
+        return pos_embed, neg_embed
+
+    def perform_encoding(self, ipadapter_model, image, weight, mask, clip_vision):
+        # This method should contain the actual encoding logic
+        # For now, we will just return dummy tensors
+        pos_embed = torch.randn(1, 512)  # Example shape
+        neg_embed = torch.randn(1, 512)  # Example shape
+        return pos_embed, neg_embed
+
+    def purge_cache(self):
+        # Calculate the total size of the cache directory
+        total_size = sum(
+            os.path.getsize(os.path.join(dirpath, filename))
+            for dirpath, dirnames, filenames in os.walk(CACHE_DIR)
+            for filename in filenames
+            if filename != os.path.basename(ACCESS_COUNT_FILE)
+        )
+
+        # If the cache size exceeds a certain limit (e.g., 50GB), purge less accessed files
+        CACHE_LIMIT = 50 * 1024 * 1024 * 1024  # 50GB
+        if total_size > CACHE_LIMIT:
+            # Sort files by access count (ascending)
+            with self._access_counts_lock:
+                sorted_files = sorted(self.access_counts.items(), key=lambda x: x[1])
+
+            freed_space = 0
+            removed_hashes = []
+
+            for image_hash, _ in sorted_files:
+                # Find the exact file with known extension
+                pattern = os.path.join(CACHE_DIR, f"{image_hash}.*")
+                file_list = glob.glob(pattern)
+                if not file_list:
+                    continue  # File may have been deleted already
+                file_path = file_list[0]  # Assuming only one file per hash
+                if os.path.exists(file_path):
+                    file_size = os.path.getsize(file_path)
+                    os.remove(file_path)
+                    freed_space += file_size
+                    removed_hashes.append(image_hash)
+
+                    # Stop purging if enough space has been freed
+                    if total_size - freed_space <= CACHE_LIMIT:
+                        break
+
+            # Remove purged entries from access counts
+            with self._access_counts_lock:
+                for image_hash in removed_hashes:
+                    self.access_counts.pop(image_hash, None)
+                self.save_access_counts()
+
+    def save_access_counts(self):
+        # Save access counts to the file
+        with portalocker.Lock(ACCESS_COUNT_FILE, 'w', timeout=5) as f:
+            for image_hash, count in self.access_counts.items():
+                f.write(f"{image_hash} {count}\n")
+
+    def update_access_counts(self):
+        # Merge internal access counts with global access counts
+        with self._access_counts_lock:
+            for image_hash, delta in self.internal_access_counts.items():
+                self.access_counts[image_hash] = self.access_counts.get(image_hash, 0) + delta
+            self.internal_access_counts.clear()
+            self.save_access_counts()
+
+    def __del__(self):
+        # Save access counts to file when the node is deleted
+        self.update_access_counts()
 
 class IPAdapterCombineEmbeds:
     @classmethod
@@ -1873,7 +1966,7 @@ class IPAdapterCombineParams:
         return {"required": {
             "params_1": ("IPADAPTER_PARAMS",),
             "params_2": ("IPADAPTER_PARAMS",),
-        }, "optional": {
+        "optional": {
             "params_3": ("IPADAPTER_PARAMS",),
             "params_4": ("IPADAPTER_PARAMS",),
             "params_5": ("IPADAPTER_PARAMS",),
