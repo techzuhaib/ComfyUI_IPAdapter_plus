@@ -1351,7 +1351,7 @@ class IPAdapterPreciseCompositionBatch(IPAdapterPreciseComposition):
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 """
 class IPAdapterEncoder:
-    _access_counts_lock = portalocker.Lock()  # Class-level lock for thread safety
+    _access_counts_lock = portalocker.Lock(ACCESS_COUNT_FILE)  # Use the access count file for locking
 
     @classmethod
     def INPUT_TYPES(cls):
