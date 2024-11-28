@@ -560,7 +560,7 @@ class IPAdapterUnifiedLoader:
     CATEGORY = "ipadapter"
 
     def load_models(self, model, preset, lora_strength=0.0, provider="CPU", ipadapter=None):
-        pipeline = { "clipvision": { 'file': None, 'model': None }, "ipadapter": { 'file': None, 'model': None }, "insightface": { 'provider': None, 'model': None } } }
+        pipeline = { "clipvision": { 'file': None, 'model': None }, "ipadapter": { 'file': None, 'model': None }, "insightface": { 'provider': None, 'model': None } } 
         if ipadapter is not None:
             pipeline = ipadapter
 
