@@ -351,7 +351,7 @@ def ipadapter_execute(model,
                     break
             else:
                 print('InsightFace: No face detected.')
-                break
+                return None, None
         face_cond_embeds = torch.stack(face_cond_embeds).to(device, dtype=dtype)
         image = torch.stack(image)
         del image_iface, face
